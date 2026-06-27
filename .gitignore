@@ -1,0 +1,10 @@
+.env
+.agents/
+.codex/
+__pycache__/
+venv/
+*.pyc
+*.log
+*.tmp
+roll_history.json
+.pytest_cache/
