@@ -4,6 +4,7 @@ Tests for core dice logic — no Telegram API required.
 Run with:  python -m pytest tests/ -v
            (from the project root, with venv active)
 """
+import asyncio
 import json
 import os
 import sys
@@ -684,3 +685,53 @@ class TestHistoryPersistence:
             assert list(bot.user_history[100]) == ["4d6dl1 → 14", "1d20 → 20"]
         finally:
             bot.HISTORY_FILE = original
+
+
+# ── Inline mode never produces a real roll ───────────────────────────────────
+#
+# Security regression tests: inline mode used to precompute real rolls via
+# execute_roll() and embed them in the message content, which could be
+# scheduled for later delivery in Telegram clients — letting a player
+# precompute a favorable roll and send it later as if it happened live.
+# These tests confirm inline is answered with a static, informational
+# message only, and never touches execute_roll()/random for any query.
+
+class _FakeInlineQuery:
+    def __init__(self, query: str):
+        self.query = query
+        self.answered_with = None
+        self.answered_cache_time = None
+
+    async def answer(self, results, cache_time=None):
+        self.answered_with = results
+        self.answered_cache_time = cache_time
+
+
+class _FakeUpdate:
+    def __init__(self, query: str):
+        self.inline_query = _FakeInlineQuery(query)
+
+
+class TestInlineNeverRolls:
+    @pytest.mark.parametrize("query", ["", "1d20", "d20", "2d6", "stats", "stats heroic", "not a roll"])
+    def test_execute_roll_never_called(self, query, monkeypatch):
+        calls = []
+        monkeypatch.setattr(bot, "execute_roll", lambda spec: calls.append(spec) or (_ for _ in ()).throw(
+            AssertionError("execute_roll() must never be called from inline_query")
+        ))
+        update = _FakeUpdate(query)
+        asyncio.run(bot.inline_query(update, None))
+        assert calls == []
+        assert update.inline_query.answered_with is not None
+
+    @pytest.mark.parametrize("query", ["", "1d20", "d20", "2d6", "stats", "stats heroic", "not a roll"])
+    def test_answers_with_single_informational_result(self, query):
+        update = _FakeUpdate(query)
+        asyncio.run(bot.inline_query(update, None))
+        results = update.inline_query.answered_with
+        assert len(results) == 1
+        assert update.inline_query.answered_cache_time == 0
+
+    def test_no_random_numbers_leak_into_disabled_text(self):
+        assert bot.INLINE_DISABLED_TEXT
+        assert "roll" in bot.INLINE_DISABLED_TEXT.lower() or "/roll" in bot.INLINE_DISABLED_TEXT

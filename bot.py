@@ -30,7 +30,6 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from uuid import uuid4
 
 from dotenv import load_dotenv
 from telegram import (
@@ -512,10 +511,8 @@ HELP_TEXT = (
     "  `/history` — tus últimos lanzamientos\n"
     "  `/help`    — esta ayuda\n\n"
     "━━━ Modo inline ━━━\n\n"
-    "  `@NombreDelBot 4d6dl1`       — lanzamiento\n"
-    "  `@NombreDelBot stats`        — stats estándar\n"
-    "  `@NombreDelBot stats heroic` — variante heroica\n\n"
-    "_Las tiradas inline no quedan registradas en /history._"
+    "  El modo inline está desactivado: no genera tiradas reales.\n"
+    "  Usa `/roll` o `/stats` directamente en este chat.\n"
 )
 
 
@@ -663,103 +660,33 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Inline handler ────────────────────────────────────────────────────────────
 #
-# Why cache_time=0 everywhere:
-# Each result's input_message_content contains specific dice numbers computed
-# at request time (e.g. "Dados: [4 + 2 + 6] → Total: 12"). Caching these —
-# even for a few seconds — would cause multiple taps within the cache window
-# to send the identical roll, breaking the fairness expectation of a dice bot.
-# cache_time=0 is the correct and intentional choice here; do not increase it.
+# Security note — inline mode never generates a real roll:
+# Telegram lets a client turn any inline result into a *scheduled* message,
+# but neither InlineQuery nor ChosenInlineResult carry any field indicating
+# that, or when the message will actually be sent. An inline result's content
+# is fixed at answer time and delivered verbatim whenever the client chooses
+# to send it — immediately or hours later. If inline computed a real roll,
+# a player could inline-roll repeatedly until a favorable result appeared,
+# then schedule that exact message to be delivered later as if it were live.
+# Since there is no reliable signal to detect or block only the scheduled
+# case, inline is disabled globally instead: it must never call
+# execute_roll() or embed randomness in the message content. Use /roll or
+# /stats in the chat for real rolls.
+
+INLINE_DISABLED_TEXT = (
+    "🎲 El modo inline está desactivado por seguridad.\n"
+    "Usa `/roll NdM` o `/stats` en este chat para lanzar dados reales."
+)
+
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.inline_query.query.strip()
-
-    if not query:
-        # Pre-compute real results; tapping sends the actual roll, not a placeholder.
-        d20_spec   = parse_roll("1d20")
-        d20_result = execute_roll(d20_spec)
-
-        stats_spec  = parse_stats_variant(None)
-        stats_rolls = [execute_roll(stats_spec) for _ in range(STATS_ROLLS)]
-
-        hints = [
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title="🎲 Lanzar 1d20",
-                description="Toca para lanzar · o escribe: 3d6 · 4d6dl1 · 2d20kh1+3 …",
-                input_message_content=InputTextMessageContent(
-                    format_result(d20_spec, d20_result),
-                    parse_mode="Markdown",
-                ),
-            ),
-            InlineQueryResultArticle(
-                id=str(uuid4()),
-                title="⚔️ Stats D&D (4d6dl1)",
-                description="Toca para generar estadísticas · o escribe: stats · stats heroic …",
-                input_message_content=InputTextMessageContent(
-                    format_stats(stats_spec, stats_rolls),
-                    parse_mode="Markdown",
-                ),
-            ),
-        ]
-        await update.inline_query.answer(hints, cache_time=0)
-        return
-
-    # ── Stats branch ──────────────────────────────────────────────────────────
-    if query.lower().startswith("stats"):
-        parts       = query.split(maxsplit=1)
-        raw_variant = parts[1] if len(parts) > 1 else None
-
-        try:
-            spec = parse_stats_variant(raw_variant)
-        except ValueError:
-            err = InlineQueryResultArticle(
-                id=str(uuid4()),
-                title="❌ Variante inválida — no enviar",
-                description="Corrige la expresión · Prueba: stats · stats heroic · stats 4d6dl1",
-                input_message_content=InputTextMessageContent(
-                    "❌ Variante inválida. Escribe `/help` en el bot para ver las opciones.",
-                ),
-            )
-            await update.inline_query.answer([err], cache_time=0)
-            return
-
-        rolls   = [execute_roll(spec) for _ in range(STATS_ROLLS)]
-        answer  = InlineQueryResultArticle(
-            id=str(uuid4()),
-            title=f"⚔️ Stats D&D ({spec.expr})",
-            description="Toca para generar y revelar estadísticas en el chat",
-            input_message_content=InputTextMessageContent(
-                format_stats(spec, rolls), parse_mode="Markdown"
-            ),
-        )
-        await update.inline_query.answer([answer], cache_time=0)
-        return
-
-    # ── Roll branch ───────────────────────────────────────────────────────────
-    try:
-        spec = parse_roll(query)
-    except ValueError:
-        err = InlineQueryResultArticle(
-            id=str(uuid4()),
-            title="❌ Expresión inválida — no enviar",
-            description="Corrige antes de tocar · Prueba: 3d6 · 4d6dl1 · 2d20kh1+3",
-            input_message_content=InputTextMessageContent(
-                "❌ Expresión inválida. Escribe `/help` en el bot para ver la sintaxis.",
-            ),
-        )
-        await update.inline_query.answer([err], cache_time=0)
-        return
-
-    result  = execute_roll(spec)
-    answer  = InlineQueryResultArticle(
-        id=str(uuid4()),
-        title=f"🎲 Lanzar {spec.expr}",
-        description="Toca para lanzar y revelar el resultado en el chat",
-        input_message_content=InputTextMessageContent(
-            format_result(spec, result), parse_mode="Markdown"
-        ),
+    info = InlineQueryResultArticle(
+        id="dice-inline-disabled",
+        title="🎲 Usa /roll en el chat",
+        description="Las tiradas inline están desactivadas — escribe /roll aquí para lanzar dados reales.",
+        input_message_content=InputTextMessageContent(INLINE_DISABLED_TEXT),
     )
-    await update.inline_query.answer([answer], cache_time=0)
+    await update.inline_query.answer([info], cache_time=0)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -790,7 +717,7 @@ def main() -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("admin",   cmd_admin))
 
-    # Inline mode
+    # Inline mode (disabled — see security note above inline_query)
     app.add_handler(InlineQueryHandler(inline_query))
 
     _load_history()
