@@ -24,12 +24,17 @@ for mod_name in ["telegram", "telegram.ext", "telegram.error", "dotenv"]:
         sys.modules[mod_name] = types.ModuleType(mod_name)
 
 class _Stub:
-    """Generic stub that accepts any constructor args without crashing."""
-    def __init__(self, *args, **kwargs): pass
+    """Generic stub that records its constructor args so tests can inspect them."""
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
 _tg = sys.modules["telegram"]
 for _attr in [
     "Update", "InlineQueryResultArticle", "InputTextMessageContent",
+    "InlineKeyboardButton", "InlineKeyboardMarkup",
 ]:
     setattr(_tg, _attr, _Stub)
 
@@ -40,7 +45,8 @@ sys.modules["telegram.error"].TelegramError = _TelegramError
 
 _ext = sys.modules["telegram.ext"]
 for _cls in [
-    "Application", "CommandHandler", "InlineQueryHandler", "ContextTypes",
+    "Application", "CommandHandler", "InlineQueryHandler",
+    "CallbackQueryHandler", "ContextTypes",
 ]:
     setattr(_ext, _cls, object)
 
@@ -687,14 +693,18 @@ class TestHistoryPersistence:
             bot.HISTORY_FILE = original
 
 
-# ── Inline mode never produces a real roll ───────────────────────────────────
+# ── Inline mode never bakes a real roll into the message content ────────────
 #
 # Security regression tests: inline mode used to precompute real rolls via
 # execute_roll() and embed them in the message content, which could be
 # scheduled for later delivery in Telegram clients — letting a player
 # precompute a favorable roll and send it later as if it happened live.
-# These tests confirm inline is answered with a static, informational
-# message only, and never touches execute_roll()/random for any query.
+#
+# Fix under test: inline_query() never calls execute_roll() and never puts
+# a resolved number in the message text — it only attaches a "reveal"
+# button. The real roll happens inside inline_reveal_callback(), triggered
+# by a live tap on the button, which can only happen once the message
+# actually exists in a chat (immediately or after a scheduled delivery).
 
 class _FakeInlineQuery:
     def __init__(self, query: str):
@@ -724,14 +734,100 @@ class TestInlineNeverRolls:
         assert calls == []
         assert update.inline_query.answered_with is not None
 
-    @pytest.mark.parametrize("query", ["", "1d20", "d20", "2d6", "stats", "stats heroic", "not a roll"])
-    def test_answers_with_single_informational_result(self, query):
+    @pytest.mark.parametrize("query", ["", "1d20", "d20", "2d6", "stats", "stats heroic"])
+    def test_valid_queries_attach_reveal_button_with_no_resolved_number(self, query):
         update = _FakeUpdate(query)
         asyncio.run(bot.inline_query(update, None))
         results = update.inline_query.answered_with
-        assert len(results) == 1
         assert update.inline_query.answered_cache_time == 0
+        for r in results:
+            reply_markup = getattr(r, "reply_markup", None)
+            assert reply_markup is not None, "valid roll/stats results must carry a reveal button"
+            content = r.input_message_content
+            assert "Resultado" not in content.args[0]
+            assert "Total" not in content.args[0]
+            assert "revela" in content.args[0].lower()
 
-    def test_no_random_numbers_leak_into_disabled_text(self):
-        assert bot.INLINE_DISABLED_TEXT
-        assert "roll" in bot.INLINE_DISABLED_TEXT.lower() or "/roll" in bot.INLINE_DISABLED_TEXT
+    def test_invalid_roll_expression_has_no_button(self):
+        update = _FakeUpdate("not a roll")
+        asyncio.run(bot.inline_query(update, None))
+        results = update.inline_query.answered_with
+        assert len(results) == 1
+        assert getattr(results[0], "reply_markup", None) is None
+
+    def test_invalid_stats_variant_has_no_button(self):
+        update = _FakeUpdate("stats xyz_invalid_99")
+        asyncio.run(bot.inline_query(update, None))
+        results = update.inline_query.answered_with
+        assert len(results) == 1
+        assert getattr(results[0], "reply_markup", None) is None
+
+
+# ── Inline reveal callback (real roll happens only on live button tap) ──────
+
+class _FakeCallbackQuery:
+    def __init__(self, data: str):
+        self.data = data
+        self.answered = None
+        self.edited_text = None
+        self.edited_kwargs = None
+
+    async def answer(self, text=None, show_alert=False):
+        self.answered = (text, show_alert)
+
+    async def edit_message_text(self, text, **kwargs):
+        self.edited_text = text
+        self.edited_kwargs = kwargs
+
+
+class _FakeCallbackUpdate:
+    def __init__(self, data: str):
+        self.callback_query = _FakeCallbackQuery(data)
+
+
+class TestInlineRevealCallback:
+    def test_roll_reveal_calls_execute_roll_and_edits_message(self):
+        update = _FakeCallbackUpdate("r:1d20")
+        asyncio.run(bot.inline_reveal_callback(update, None))
+        cq = update.callback_query
+        assert cq.answered is not None
+        assert cq.edited_text is not None
+        assert "1d20" in cq.edited_text
+        assert cq.edited_kwargs["reply_markup"] is None
+
+    def test_stats_reveal_calls_execute_roll_and_edits_message(self):
+        update = _FakeCallbackUpdate("s:4d6dl1")
+        asyncio.run(bot.inline_reveal_callback(update, None))
+        cq = update.callback_query
+        assert cq.edited_text is not None
+        assert "4d6dl1" in cq.edited_text
+        assert "Estadísticas" in cq.edited_text
+
+    def test_execute_roll_only_runs_on_reveal_not_before(self, monkeypatch):
+        calls = []
+        original = bot.execute_roll
+        def spy(spec):
+            calls.append(spec)
+            return original(spec)
+        monkeypatch.setattr(bot, "execute_roll", spy)
+        assert calls == []
+        update = _FakeCallbackUpdate("r:2d6")
+        asyncio.run(bot.inline_reveal_callback(update, None))
+        assert len(calls) == 1
+
+    def test_invalid_roll_payload_does_not_execute_roll(self, monkeypatch):
+        monkeypatch.setattr(bot, "execute_roll", lambda spec: (_ for _ in ()).throw(
+            AssertionError("execute_roll() must not run for an invalid payload")
+        ))
+        update = _FakeCallbackUpdate("r:not-a-roll")
+        asyncio.run(bot.inline_reveal_callback(update, None))
+        cq = update.callback_query
+        assert cq.answered[1] is True   # show_alert
+        assert cq.edited_text is None
+
+    def test_unknown_kind_is_a_no_op(self):
+        update = _FakeCallbackUpdate("x:whatever")
+        asyncio.run(bot.inline_reveal_callback(update, None))
+        cq = update.callback_query
+        assert cq.answered is not None
+        assert cq.edited_text is None

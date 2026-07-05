@@ -30,18 +30,22 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from telegram import (
     Update,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     InlineQueryHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -511,8 +515,11 @@ HELP_TEXT = (
     "  `/history` — tus últimos lanzamientos\n"
     "  `/help`    — esta ayuda\n\n"
     "━━━ Modo inline ━━━\n\n"
-    "  El modo inline está desactivado: no genera tiradas reales.\n"
-    "  Usa `/roll` o `/stats` directamente en este chat.\n"
+    "  `@NombreDelBot 4d6dl1`       — prepara un lanzamiento\n"
+    "  `@NombreDelBot stats`        — prepara stats estándar\n"
+    "  `@NombreDelBot stats heroic` — prepara variante heroica\n\n"
+    "_El mensaje inline no muestra ningún número: pulsa el botón_\n"
+    "_🎲 Revelar en el chat para generar y mostrar el resultado real._"
 )
 
 
@@ -660,33 +667,160 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Inline handler ────────────────────────────────────────────────────────────
 #
-# Security note — inline mode never generates a real roll:
+# Security note — inline never bakes a real roll into the message content:
 # Telegram lets a client turn any inline result into a *scheduled* message,
 # but neither InlineQuery nor ChosenInlineResult carry any field indicating
-# that, or when the message will actually be sent. An inline result's content
-# is fixed at answer time and delivered verbatim whenever the client chooses
-# to send it — immediately or hours later. If inline computed a real roll,
-# a player could inline-roll repeatedly until a favorable result appeared,
-# then schedule that exact message to be delivered later as if it were live.
-# Since there is no reliable signal to detect or block only the scheduled
-# case, inline is disabled globally instead: it must never call
-# execute_roll() or embed randomness in the message content. Use /roll or
-# /stats in the chat for real rolls.
+# that, or when the message will actually be sent. A result's content is
+# fixed at answer time and delivered verbatim whenever the client sends it —
+# immediately or hours later. If inline computed the roll up front, a player
+# could inline-roll repeatedly until a favorable result appeared, then
+# schedule that exact message to be delivered later as if it were live.
+#
+# Fix: inline results carry no dice numbers at all — only a "reveal" button
+# (reply_markup). Selecting a result with reply_markup makes Telegram assign
+# the sent message an inline_message_id once it is actually delivered to a
+# chat (this is the same mechanism Telegram's own inline games use to update
+# scores after the fact). execute_roll() only runs inside
+# inline_reveal_callback(), triggered by a real tap on that live message —
+# which cannot happen before the message exists in the chat, so a scheduled
+# message still shows nothing but the pending placeholder until someone
+# taps it live. The button is removed after one reveal so the result can't
+# be rerolled.
 
-INLINE_DISABLED_TEXT = (
-    "🎲 El modo inline está desactivado por seguridad.\n"
-    "Usa `/roll NdM` o `/stats` en este chat para lanzar dados reales."
-)
+def _pending_roll_text(expr: str) -> str:
+    return f"🎲 *{expr}*\n└ _Pulsa el botón para revelar el resultado_"
+
+
+def _pending_stats_text(expr: str) -> str:
+    return f"⚔️ *Stats D&D ({expr})*\n_Pulsa el botón para revelar las estadísticas_"
+
+
+def _reveal_keyboard(payload: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎲 Revelar", callback_data=payload)]])
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    info = InlineQueryResultArticle(
-        id="dice-inline-disabled",
-        title="🎲 Usa /roll en el chat",
-        description="Las tiradas inline están desactivadas — escribe /roll aquí para lanzar dados reales.",
-        input_message_content=InputTextMessageContent(INLINE_DISABLED_TEXT),
+    query = update.inline_query.query.strip()
+
+    if not query:
+        d20_spec   = parse_roll("1d20")
+        stats_spec = parse_stats_variant(None)
+
+        hints = [
+            InlineQueryResultArticle(
+                id=str(uuid4()),
+                title="🎲 Preparar 1d20",
+                description="Toca para insertar · el resultado se revela al pulsar el botón en el chat",
+                input_message_content=InputTextMessageContent(
+                    _pending_roll_text(d20_spec.expr), parse_mode="Markdown"
+                ),
+                reply_markup=_reveal_keyboard(f"r:{d20_spec.expr}"),
+            ),
+            InlineQueryResultArticle(
+                id=str(uuid4()),
+                title="⚔️ Preparar stats D&D (4d6dl1)",
+                description="Toca para insertar · las estadísticas se revelan al pulsar el botón",
+                input_message_content=InputTextMessageContent(
+                    _pending_stats_text(stats_spec.expr), parse_mode="Markdown"
+                ),
+                reply_markup=_reveal_keyboard(f"s:{stats_spec.expr}"),
+            ),
+        ]
+        await update.inline_query.answer(hints, cache_time=0)
+        return
+
+    # ── Stats branch ──────────────────────────────────────────────────────────
+    if query.lower().startswith("stats"):
+        parts       = query.split(maxsplit=1)
+        raw_variant = parts[1] if len(parts) > 1 else None
+
+        try:
+            spec = parse_stats_variant(raw_variant)
+        except ValueError:
+            err = InlineQueryResultArticle(
+                id=str(uuid4()),
+                title="❌ Variante inválida — no enviar",
+                description="Corrige la expresión · Prueba: stats · stats heroic · stats 4d6dl1",
+                input_message_content=InputTextMessageContent(
+                    "❌ Variante inválida. Escribe `/help` en el bot para ver las opciones.",
+                ),
+            )
+            await update.inline_query.answer([err], cache_time=0)
+            return
+
+        answer = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title=f"⚔️ Preparar stats D&D ({spec.expr})",
+            description="Toca para insertar · se revela al pulsar el botón en el chat",
+            input_message_content=InputTextMessageContent(
+                _pending_stats_text(spec.expr), parse_mode="Markdown"
+            ),
+            reply_markup=_reveal_keyboard(f"s:{spec.expr}"),
+        )
+        await update.inline_query.answer([answer], cache_time=0)
+        return
+
+    # ── Roll branch ───────────────────────────────────────────────────────────
+    try:
+        spec = parse_roll(query)
+    except ValueError:
+        err = InlineQueryResultArticle(
+            id=str(uuid4()),
+            title="❌ Expresión inválida — no enviar",
+            description="Corrige antes de tocar · Prueba: 3d6 · 4d6dl1 · 2d20kh1+3",
+            input_message_content=InputTextMessageContent(
+                "❌ Expresión inválida. Escribe `/help` en el bot para ver la sintaxis.",
+            ),
+        )
+        await update.inline_query.answer([err], cache_time=0)
+        return
+
+    answer = InlineQueryResultArticle(
+        id=str(uuid4()),
+        title=f"🎲 Preparar {spec.expr}",
+        description="Toca para insertar · se revela al pulsar el botón en el chat",
+        input_message_content=InputTextMessageContent(
+            _pending_roll_text(spec.expr), parse_mode="Markdown"
+        ),
+        reply_markup=_reveal_keyboard(f"r:{spec.expr}"),
     )
-    await update.inline_query.answer([info], cache_time=0)
+    await update.inline_query.answer([answer], cache_time=0)
+
+
+# ── Inline reveal callback ────────────────────────────────────────────────────
+
+async def inline_reveal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Compute and reveal the real roll only when the button is actually tapped.
+
+    Runs at the moment of live interaction on a message that already exists
+    in a chat — whether it was sent immediately or delivered later as a
+    scheduled message, no roll exists until this handler executes. The
+    button is removed after reveal, so a result can't be rerolled.
+    """
+    query = update.callback_query
+    kind, _, payload = (query.data or "").partition(":")
+
+    try:
+        if kind == "r":
+            spec   = parse_roll(payload)
+            result = execute_roll(spec)
+            text   = format_result(spec, result)
+        elif kind == "s":
+            spec  = parse_stats_variant(payload)
+            rolls = [execute_roll(spec) for _ in range(STATS_ROLLS)]
+            text  = format_stats(spec, rolls)
+        else:
+            await query.answer()
+            return
+    except ValueError:
+        await query.answer("❌ Expresión inválida.", show_alert=True)
+        return
+
+    await query.answer()
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=None)
+    except TelegramError as exc:
+        logger.error("Failed to reveal inline roll: %s", exc)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -717,8 +851,9 @@ def main() -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("admin",   cmd_admin))
 
-    # Inline mode (disabled — see security note above inline_query)
+    # Inline mode — reveal is deferred to a button tap; see security note above inline_query
     app.add_handler(InlineQueryHandler(inline_query))
+    app.add_handler(CallbackQueryHandler(inline_reveal_callback, pattern=r"^[rs]:"))
 
     _load_history()
     logger.info("Bot iniciado. Ctrl+C para detener.")

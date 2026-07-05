@@ -1,6 +1,6 @@
 # 🎲 Super Dice Roll Bot
 
-Bot de Telegram para lanzar dados de cualquier tipo, con soporte para D&D y otros juegos de rol. Funciona en chats privados y grupos (el modo inline está desactivado por seguridad, ver [Modo inline](#modo-inline)).
+Bot de Telegram para lanzar dados de cualquier tipo, con soporte para D&D y otros juegos de rol. Funciona en chats privados, grupos y modo inline (el resultado se revela con un botón — ver [Modo inline](#modo-inline)).
 
 ---
 
@@ -10,6 +10,7 @@ Bot de Telegram para lanzar dados de cualquier tipo, con soporte para D&D y otro
 - Selectores **keep/drop**: `kh`, `kl`, `dh`, `dl`
 - Generación de estadísticas D&D con múltiples variantes
 - Historial de tiradas por usuario (en memoria)
+- Modo inline: `@TuBot 4d6dl1` desde cualquier chat — el resultado se revela con un botón, nunca se precalcula
 - Validación de entrada con mensajes de error claros
 - Tiradas críticas y pifias detectadas automáticamente (🎯 / 💀)
 
@@ -115,9 +116,11 @@ start - Inicia el bot y muestra los controles rápidos
 
 > Si BotFather no muestra la opción de scope, podés definir los mismos comandos para todos los contextos con `/setcommands` → **"For all chats"** y luego refinarlo.
 
-### Modo inline
+### Activar modo inline
 
-No es necesario activarlo: el modo inline está desactivado a nivel de código por seguridad (ver [Modo inline](#modo-inline) más abajo). Si `/setinline` ya está configurado en BotFather, no hay problema en dejarlo así — el bot solo responderá con un mensaje informativo, sin tiradas reales.
+```
+/setinline → escribe una descripción corta, ej: "3d6+2, 4d6dl1, stats..."
+```
 
 ---
 
@@ -241,9 +244,20 @@ Mensaje de bienvenida con un resumen de comandos. Ideal para usuarios nuevos.
 
 ### Modo inline
 
-**Desactivado por seguridad.** Telegram permite convertir cualquier resultado inline en un mensaje *programado*, pero no expone ninguna señal fiable para distinguir ese caso de un envío inmediato. Como el contenido de un resultado inline se fija en el momento de la consulta y se entrega tal cual cuando el cliente decide enviarlo, un resultado inline con una tirada real permitiría precomputar un resultado favorable y programarlo para más tarde como si fuera legítimo.
+Escribe `@NombreDelBot` seguido de una expresión en **cualquier chat**. El mensaje que se inserta no contiene ningún número: solo un botón **🎲 Revelar**. La tirada real se genera recién cuando alguien pulsa ese botón en el chat, y el botón desaparece tras usarse (no se puede re-tirar).
 
-Por eso `@NombreDelBot` en cualquier chat solo devuelve un mensaje informativo (sin números aleatorios reales) que indica usar `/roll` o `/stats` en el chat.
+```
+@TuBot 3d6          → prepara 3d6
+@TuBot 4d6dl1       → prepara 4d6 descarta el más bajo
+@TuBot 2d20kh1+3    → prepara ventaja con +3
+@TuBot stats        → prepara estadísticas estándar
+@TuBot stats heroic → prepara variante heroica
+@TuBot              → acceso rápido a 1d20 y stats
+```
+
+**Por qué funciona así:** Telegram permite convertir cualquier resultado inline en un mensaje *programado*, pero no expone ninguna señal fiable (ni en `InlineQuery` ni en `ChosenInlineResult`) para distinguir ese caso de un envío inmediato, ni para saber cuándo se entregará realmente. Si el bot calculara la tirada en el momento de la consulta, alguien podría tirar varias veces por inline hasta obtener un resultado favorable y programar ese mensaje exacto para más tarde, como si fuera legítimo.
+
+En vez de desactivar el modo inline, el resultado se difiere: el mensaje inline solo lleva un botón (`reply_markup`), y Telegram asigna un `inline_message_id` editable una vez que ese mensaje se entrega de verdad al chat — el mismo mecanismo que usan los juegos inline oficiales de Telegram para actualizar puntajes. `execute_roll()` solo se ejecuta dentro del callback del botón, disparado por una pulsación real sobre un mensaje que ya existe en el chat. Un mensaje programado, entonces, no muestra ningún número hasta que alguien lo revela en vivo, después de la entrega.
 
 ---
 
